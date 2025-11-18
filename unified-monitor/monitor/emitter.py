@@ -6,8 +6,13 @@ from datetime import datetime
 
 class EventEmitter:
     """
-    Outputs monitoring events in either JSON or Table format.
-    Works on both Linux and Windows.
+    Outputs monitoring events in JSON, Table, C-style, or Silent mode.
+
+    output_format:
+      - "table"  -> pipe-style table rows
+      - "json"   -> pretty JSON per event
+      - "c"      -> monitors print their own C-style lines; emitter stays quiet
+      - "silent" -> no output
     """
 
     def __init__(self, out="stdout", output_format="table"):
@@ -15,33 +20,57 @@ class EventEmitter:
         self.out = out
         self.hostname = socket.gethostname()
 
-        print(f"[Emitter] Output: {self.output_format}, Target: {self.out}")
+        # Don't print emitter startup in silent mode
+        if self.output_format != "silent" and self.out != "silent":
+            print(f"[Emitter] Output: {self.output_format}, Target: {self.out}")
 
     def emit(self, event):
-        """Format and send the event."""
+        """Emit event based on selected output format."""
 
-        event_record = {
-            "timestamp": time.time(),
-            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "host": self.hostname,
-            "source": event.source,
-            "subtype": event.subtype,
-            "data": event.data
-        }
+        # --- FULL SILENT MODE ---
+        if self.output_format == "silent" or self.out == "silent":
+            return  # do nothing, completely silent
 
+        # ------ JSON MODE ------
         if self.output_format == "json":
-            print(json.dumps(event_record, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "timestamp": event.ts,
+                        "datetime": datetime.fromtimestamp(event.ts).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                        "host": event.host,
+                        "source": event.source,
+                        "subtype": event.subtype,
+                        "data": event.data,
+                    },
+                    indent=2,
+                )
+            )
+            return
 
-        elif self.output_format == "table":
-            self._print_table(event_record)
+        # ----- TABLE MODE -----
+        if self.output_format == "table":
+            print(
+                f"| {datetime.fromtimestamp(event.ts).strftime('%Y-%m-%d %H:%M:%S')} | "
+                f"{event.source} | {event.subtype} | {event.data} |"
+            )
+            return
 
-        else:
-            print("[Emitter] Unknown format, falling back to raw print:")
-            print(event_record)
+        # ----- C-STYLE MODE -----
+        if self.output_format == "c":
+            # In "c" mode, individual monitors (fs, process, etc.) already
+            # print C-style lines like:
+            #   FS | modified | path=... | ...
+            #
+            # So we don't print anything here to avoid duplicates.
+            return
 
-    def _print_table(self, record):
-        """Pretty table style display in terminal."""
-        print(f"| {record['datetime']} | {record['source']} | {record['subtype']} | {record['data']} |")
+        # FALLBACK (should not happen now)
+        print("[Emitter] Unknown format, event:")
+        print(event)
 
     def close(self):
-        print("[Emitter] Shutdown complete.")
+        if self.output_format != "silent" and self.out != "silent":
+            print("[Emitter] Shutdown complete.")

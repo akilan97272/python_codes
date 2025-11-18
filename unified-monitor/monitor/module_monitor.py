@@ -1,48 +1,137 @@
-from .base import BaseMonitor
+import os
 import time
-try:
-    import psutil
-except Exception:
-    psutil = None
-
-class ModuleMonitor(BaseMonitor):
-    def __init__(self, emitter, poll_interval=5.0):
-        super().__init__("module", emitter, poll_interval)
-        self._snapshot = {}
-
-    def monitor(self):
-        if psutil is None:
-            self.emit("warning", {"msg":"psutil not available for module snapshotting"})
-            return
-        while not self.stopped():
-            try:
-                for p in psutil.process_iter(attrs=["pid","name"]):
-                    pid = p.info["pid"]
-                    mods = set()
-                    try:
-                        for m in p.memory_maps():
-                            path = getattr(m,"path",None)
-                            if path and (path.endswith(".dll") or path.endswith(".so")):
-                                mods.add(path)
-                    except Exception:
-                        continue
-                    old = self._snapshot.get(pid, set())
-                    new_add = mods - old
-                    removed = old - mods
-                    for m in new_add:
-                        self.emit("load", {"pid": pid, "module": m, "proc": p.info.get("name")})
-                    for m in removed:
-                        self.emit("unload", {"pid": pid, "module": m, "proc": p.info.get("name")})
-                    self._snapshot[pid] = mods
-                dead = [pid for pid in list(self._snapshot.keys()) if not psutil.pid_exists(pid)]
-                for pid in dead:
-                    self._snapshot.pop(pid, None)
-                time.sleep(self.poll_interval)
-            except Exception as e:
-                self.emit("error", {"stage":"module_poll","err":str(e)})
-                time.sleep(self.poll_interval)
+import socket
+import platform
+from datetime import datetime
 
 
-# ✅ 3. Network Monitor
-# # Monitors network traffic such as new connections or packet flow.
-# Helps identify unusual communication or potential attacks.
+# =============================================================
+#  EVENT STRUCTURE
+# =============================================================
+class Event:
+    def __init__(self, source, subtype, ts, host, os, data):
+        self.source = source
+        self.subtype = subtype      # load, unload, error
+        self.ts = ts
+        self.host = host
+        self.os = os
+        self.data = data
+
+
+# =============================================================
+#  HUMAN-READABLE EMITTER
+# =============================================================
+class EventEmitter:
+    def emit(self, event: Event):
+        ts = datetime.fromtimestamp(event.ts).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{event.subtype.upper()}] {ts}")
+        print(f"Process:  {event.data.get('proc')} (PID: {event.data.get('pid')})")
+        print(f"Module:   {event.data.get('module')}")
+        print(f"Message:  {event.data.get('message')}")
+        print()
+
+
+# =============================================================
+#  EVENT WRAPPER
+# =============================================================
+def emit_event(emitter, subtype, pid, proc, module, message):
+    event = Event(
+        source="module",
+        subtype=subtype,
+        ts=time.time(),
+        host=socket.gethostname(),
+        os=platform.platform(),
+        data={
+            "pid": pid,
+            "proc": proc,
+            "module": module,
+            "message": message
+        }
+    )
+    emitter.emit(event)
+
+
+# =============================================================
+#  GET PROCESS NAME
+# =============================================================
+def get_process_name(pid):
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            return f.read().strip()
+    except:
+        return "unknown"
+
+
+# =============================================================
+#  GET LIST OF LOADED MODULES (.so files)
+# =============================================================
+def get_loaded_modules(pid):
+    modules = set()
+    maps_file = f"/proc/{pid}/maps"
+
+    if not os.path.exists(maps_file):
+        return modules
+
+    try:
+        with open(maps_file, "r", errors="ignore") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 6:
+                    path = parts[-1]
+                    if path.endswith(".so"):  # Linux library
+                        modules.add(path)
+    except:
+        pass
+
+    return modules
+
+
+# =============================================================
+#  MAIN MODULE MONITOR
+# =============================================================
+def monitor_modules(emitter, interval=2.0):
+    print("[module-monitor] Linux module monitor started...\n")
+
+    snapshot = {}  # pid → modules
+
+    while True:
+        try:
+            # Get list of active PIDs
+            pids = [pid for pid in os.listdir("/proc") if pid.isdigit()]
+
+            for pid in pids:
+                pid = int(pid)
+                proc_name = get_process_name(pid)
+
+                new_modules = get_loaded_modules(pid)
+                old_modules = snapshot.get(pid, set())
+
+                # -------- Detect New Modules Loaded --------
+                for mod in new_modules - old_modules:
+                    emit_event(emitter, "load", pid, proc_name, mod, "Module loaded")
+
+                # -------- Detect Modules Unloaded --------
+                for mod in old_modules - new_modules:
+                    emit_event(emitter, "unload", pid, proc_name, mod, "Module unloaded")
+
+                # FIX: correct snapshot update
+                snapshot[pid] = new_modules
+
+            # Remove processes that no longer exist
+            dead = [pid for pid in snapshot if not os.path.exists(f"/proc/{pid}")]
+            for pid in dead:
+                snapshot.pop(pid, None)
+
+            time.sleep(interval)
+
+        except Exception as e:
+            emit_event(emitter, "error", "-", "system", "-", f"Error: {str(e)}")
+            time.sleep(interval)
+
+
+# =============================================================
+#  ENTRY POINT
+# =============================================================
+if __name__ == "__main__":
+    emitter = EventEmitter()
+    monitor_modules(emitter, interval=2)

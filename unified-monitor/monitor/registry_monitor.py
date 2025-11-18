@@ -1,122 +1,162 @@
-from .base import BaseMonitor
-import platform
 import os
 import time
-
-try:
-    import wmi   # Windows registry backend
-except Exception:
-    wmi = None
-
-# Detect OS
-IS_WINDOWS = platform.system().lower().startswith("win")
-IS_LINUX = platform.system().lower().startswith("linux")
+import platform
+import socket
+from datetime import datetime
 
 
-class RegistryMonitor(BaseMonitor):
+
+# =============================================================
+#  SIMPLE EVENT CLASS
+# =============================================================
+class Event:
+    def __init__(self, source, subtype, ts, host, os, data):
+        self.source = source
+        self.subtype = subtype
+        self.ts = ts
+        self.host = host
+        self.os = os
+        self.data = data
+
+
+# =============================================================
+#  CLEAN HUMAN-READABLE EMITTER
+# =============================================================
+class EventEmitter:
+    def emit(self, event: Event):
+        timestamp = datetime.fromtimestamp(event.ts).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{event.subtype.upper()}] {timestamp}")
+        print(f"File:     {event.data.get('file')}")
+        print(f"Message:  {event.data.get('message')}")
+        print()  # blank line
+
+
+# =============================================================
+#  EVENT WRAPPER
+# =============================================================
+def emit_event(emitter, subtype, data):
+    event = Event(
+        source="registry",
+        subtype=subtype,
+        ts=datetime.now().timestamp(),
+        host=socket.gethostname(),
+        os=platform.platform(),
+        data=data
+    )
+    emitter.emit(event)
+
+
+# =============================================================
+#  TRACK FILE CREATION, MODIFICATION, DELETION
+# =============================================================
+def scan_files(root_paths):
     """
-    Windows → monitors Registry
-    Linux   → monitors system config folders (/etc, ~/.config)
+    Returns a dict: { file_path: mtime }
     """
+    snapshot = {}
 
-    def __init__(self, emitter, keys=None, poll_interval=2.0):
-        super().__init__("registry", emitter, poll_interval)
+    for root in root_paths:
+        if not os.path.isdir(root):
+            continue
 
-        # Windows registry keys
-        self.keys = keys or [
-            r"HKEY_LOCAL_MACHINE\\SOFTWARE",
-            r"HKEY_CURRENT_USER\\SOFTWARE"
-        ]
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                full_path = os.path.join(dirpath, filename)
+                try:
+                    snapshot[full_path] = os.path.getmtime(full_path)
+                except Exception:
+                    pass
 
-        # Linux config folders
-        self.linux_paths = [
-            "/etc",
-            os.path.expanduser("~/.config")
-        ]
+    return snapshot
 
-    # ------------------------------------------------------------------
-    # MAIN DISPATCHER
-    # ------------------------------------------------------------------
-    def monitor(self):
-        if IS_WINDOWS:
-            self._monitor_windows_registry()
-        elif IS_LINUX:
-            self._monitor_linux_config()
-        else:
-            self.emit("warning", {"msg": "Unsupported OS"})
 
-    # ------------------------------------------------------------------
-    # WINDOWS REGISTRY MONITORING
-    # ------------------------------------------------------------------
-    def _monitor_windows_registry(self):
-        if wmi is None:
-            self.emit("error", {"msg": "WMI not installed. Install pywin32/wmi"})
-            return
+# =============================================================
+#  MAIN LINUX CONFIG MONITOR
+# =============================================================
+def monitor_linux_config(emitter, paths, interval=1.0):
+    print("[registry-monitor] Linux config monitor started")
+    print("[registry-monitor] Watching:")
+    for p in paths:
+        print(" •", p)
+    print()
 
-        self.emit("info", {"msg": "Windows Registry Monitoring started"})
+    previous = scan_files(paths)
 
-        c = wmi.WMI()
-        watcher = c.watch_for(
-            notification_type='Creation',
-            wmi_class='RegistryValueChangeEvent'
-        )
+    while True:
+        time.sleep(interval)
+        current = scan_files(paths)
 
-        while not self.stopped():
-            try:
-                evt = watcher(timeout_ms=int(self.poll_interval * 1000))
-                if not evt:
-                    continue
-
-                hive = getattr(evt, 'Hive', '')
-                key = getattr(evt, 'KeyPath', '')
-                value = getattr(evt, 'ValueName', '')
-
-                self.emit("change", {
-                    "hive": hive,
-                    "key": key,
-                    "value": value
+        # --- Detect deleted files ---
+        for f in previous:
+            if f not in current:
+                emit_event(emitter, "change", {
+                    "file": f,
+                    "message": "File deleted"
                 })
 
-            except Exception as e:
-                self.emit("error", {"stage": "windows_registry", "err": str(e)})
-                time.sleep(self.poll_interval)
+        # --- Detect newly created files ---
+        for f in current:
+            if f not in previous:
+                emit_event(emitter, "change", {
+                    "file": f,
+                    "message": "File created"
+                })
 
-    # ------------------------------------------------------------------
-    # LINUX CONFIG MONITORING
-    # ------------------------------------------------------------------
-    def _monitor_linux_config(self):
-        """
-        Linux alternative for registry monitoring:
-        Watches /etc and ~/.config for modifications using mtime checking.
-        """
-        self.emit("info", {"msg": "Linux Config Monitoring started"})
+        # --- Detect modified files ---
+        for f in current:
+            if f in previous and current[f] != previous[f]:
+                emit_event(emitter, "change", {
+                    "file": f,
+                    "message": "File modified"
+                })
 
-        last_mtime = {}
+        previous = current
 
-        # Initialize timestamps
-        for path in self.linux_paths:
-            if os.path.exists(path):
-                last_mtime[path] = os.path.getmtime(path)
 
-        while not self.stopped():
-            try:
-                for path in self.linux_paths:
-                    if not os.path.exists(path):
-                        continue
+# =============================================================
+#  WINDOWS REGISTRY MONITOR (DISABLED ON LINUX)
+# =============================================================
+def monitor_windows_registry(emitter):
+    try:
+        import wmi
+    except:
+        emit_event(emitter, "error", {"message": "WMI not installed"})
+        return
 
-                    current_m = os.path.getmtime(path)
+    emit_event(emitter, "info", {"message": "Windows registry monitoring started"})
 
-                    # If changed → emit event
-                    if path in last_mtime and current_m != last_mtime[path]:
-                        self.emit("change", {
-                            "file": path,
-                            "msg": "Configuration directory changed"
-                        })
+    c = wmi.WMI()
+    watcher = c.watch_for(
+        notification_type='Creation',
+        wmi_class='RegistryValueChangeEvent'
+    )
 
-                    last_mtime[path] = current_m
+    while True:
+        try:
+            evt = watcher()
+            emit_event(emitter, "change", {
+                "file": evt.KeyPath,
+                "message": f"Registry value changed: {evt.ValueName}"
+            })
+        except Exception as e:
+            emit_event(emitter, "error", {"message": str(e)})
+            time.sleep(1)
 
-                time.sleep(self.poll_interval)
 
-            except Exception as e:
-                self.emit("error", {"stage": "linux_config", "err": str(e)})
-                time.sleep(self.poll_interval)
+# =============================================================
+#  ENTRY POINT
+# =============================================================
+if __name__ == "__main__":
+    emitter = EventEmitter()
+
+    if platform.system().lower().startswith("win"):
+        monitor_windows_registry(emitter)
+    else:
+        monitor_linux_config(
+            emitter,
+            paths=[
+                "/etc",
+                os.path.expanduser("~/.config")
+            ],
+            interval=1.0
+        )

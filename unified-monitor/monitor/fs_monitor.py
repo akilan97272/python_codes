@@ -1,139 +1,191 @@
-from .base import BaseMonitor
-import os, time
-from typing import List
+#!/usr/bin/env python3
 
-# Linux inotify backend
-try:
-    from inotify_simple import INotify, flags
-except Exception:
-    INotify = None
-    flags = None
-
-# Cross-platform watchdog backend
-try:
-    from watchdog.observers import Observer as WatchdogObserver
-    from watchdog.events import FileSystemEventHandler as WatchdogHandler
-except Exception:
-    WatchdogObserver = None
-    WatchdogHandler = None
+import subprocess
+import time
+import socket
+import platform
+from datetime import datetime
 
 
-class FSMonitor(BaseMonitor):
-    def __init__(self, emitter, paths: List[str], enable_integrity: bool = True, poll_interval: float = 1.0):
-        super().__init__("fs", emitter, poll_interval)
+# Directories we usually DON'T want to walk (too noisy / virtual)
+EXCLUDE_DIRS = {
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/var/lib/docker",
+    "/snap",
+}
 
-        # FIX 1: expand "~" correctly
-        self.paths = [os.path.expanduser(p) for p in paths]
 
-        # FIX 2: keep only existing directories
-        self.paths = [p for p in self.paths if os.path.isdir(p)]
+# =============================================================
+#  HUMAN-READABLE EVENT PRINTER
+# =============================================================
+def print_event(event_type, path, extra=None):
+    """
+    Print a simple, human-readable filesystem event.
+    event_type: "CREATED", "DELETED", "MODIFIED", "INFO", "ERROR"
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{event_type}] {ts}")
+    print(f"Path:     {path}")
+    if extra:
+        for k, v in extra.items():
+            print(f"{k}: {v}")
+    print()  # blank line for readability
 
-        if not self.paths:
-            emitter.emit("warning", {"msg": "No valid directories to watch"})
 
-        self.enable_integrity = enable_integrity
+# =============================================================
+#  BUILD SNAPSHOT USING LINUX 'find'
+# =============================================================
+def build_snapshot(paths, exclude_dirs=None):
+    """
+    Use Linux 'find' command to build a snapshot of files.
 
-    # ---------------- MAIN MONITOR ---------------------
+    Returns:
+        { path: (mtime_float, size_int) }
+    """
+    snapshot = {}
+    exclude_dirs = exclude_dirs or set()
 
-    def monitor(self):
-        if INotify is not None:
-            self._monitor_inotify()
-        elif WatchdogObserver is not None:
-            self._monitor_watchdog()
-        else:
-            self.emit("warning", {"msg": "No FS backend available"})
+    # Prepare the base 'find' command:
+    # find <paths...> \( -path /proc -o -path /sys ... \) -prune -o -type f -printf '%p|%T@|%s\n'
+    cmd = ["find"]
+    cmd.extend(paths)
 
-    # ---------------- LINUX INOTIFY BACKEND ---------------------
+    # Exclusion part
+    if exclude_dirs:
+        cmd.append("(")
+        first = True
+        for d in sorted(exclude_dirs):
+            if not first:
+                cmd.append("-o")
+            cmd.extend(["-path", d])
+            first = False
+        cmd.extend([")", "-prune", "-o"])
 
-    def _monitor_inotify(self):
-        inotify = INotify()
-        watches = {}
+    # Only files, print "path|mtime|size"
+    cmd.extend(["-type", "f", "-printf", "%p|%T@|%s\n"])
 
-        mask = (
-            flags.CREATE |
-            flags.MODIFY |
-            flags.DELETE |
-            flags.MOVED_FROM |
-            flags.MOVED_TO
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False
         )
+    except Exception as e:
+        print_event("ERROR", "-", {"Error": f"Failed to run find: {e}"})
+        return snapshot
 
-        # Add watches
-        for p in self.paths:
-            try:
-                wd = inotify.add_watch(p, mask)
-                watches[wd] = p
-                self.emit("info", {"msg": f"📁 Watching (inotify): {p}"})
-            except Exception as e:
-                self.emit("warning", {"path": p, "err": str(e)})
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
 
-        while not self.stopped():
-            events = inotify.read(timeout=int(self.poll_interval * 1000))
+        # path|mtime|size
+        parts = line.rsplit("|", 2)
+        if len(parts) != 3:
+            continue
 
-            for e in events:
-                base = watches.get(e.wd, "?")
-                name = (
-                    e.name.decode("utf-8", errors="ignore")
-                    if isinstance(e.name, (bytes, bytearray))
-                    else e.name
-                )
-                path = os.path.join(base, name) if name else base
-
-                # determine event type
-                if e.mask & flags.CREATE:
-                    subtype = "create"
-                elif e.mask & flags.MODIFY:
-                    subtype = "modify"
-                elif e.mask & flags.DELETE:
-                    subtype = "delete"
-                else:
-                    subtype = "move"
-
-                self.emit(subtype, {"path": path})
-
-    # ---------------- WATCHDOG BACKEND ---------------------
-
-    def _monitor_watchdog(self):
-        class Handler(WatchdogHandler):
-            def __init__(self, outer):
-                self.outer = outer
-                super().__init__()
-
-            def on_created(self, event):
-                if not event.is_directory:
-                    self.outer.emit("create", {"path": event.src_path})
-
-            def on_modified(self, event):
-                if not event.is_directory:
-                    self.outer.emit("modify", {"path": event.src_path})
-
-            def on_moved(self, event):
-                self.outer.emit("move", {"src": event.src_path, "dst": event.dest_path})
-
-            def on_deleted(self, event):
-                self.outer.emit("delete", {"path": event.src_path})
-
-        obs = WatchdogObserver()
-        handler = Handler(self)
-
-        # Add directory watchers
-        for p in self.paths:
-            try:
-                obs.schedule(handler, p, recursive=True)
-                self.emit("info", {"msg": f"📁 Watching (watchdog): {p}"})
-            except Exception as e:
-                self.emit("warning", {"path": p, "err": str(e)})
-
-        obs.start()
-
+        path, mtime_str, size_str = parts
         try:
-            while not self.stopped():
-                time.sleep(self.poll_interval)
-        finally:
-            obs.stop()
-            obs.join()
+            mtime = float(mtime_str)
+            size = int(size_str)
+        except ValueError:
+            continue
+
+        snapshot[path] = (mtime, size)
+
+    return snapshot
 
 
+# =============================================================
+#  MAIN FS MONITOR LOOP
+# =============================================================
+def monitor_fs(paths=None, interval=5):
+    """
+    Polling-based filesystem monitor using Linux 'find'.
 
-# ✅ 2. File System Monitor (2 lines)
-# Watches the file system for any create, delete, modify, or move events.
-# Useful for detecting unauthorized file changes or malware activity.
+    If `paths` is None:
+      - It will watch: /home, /etc, /var/log
+
+    Detects:
+      - File created
+      - File deleted
+      - File modified
+    """
+    if platform.system().lower() != "linux":
+        print_event("ERROR", "-", {"Error": "FS monitor only supports Linux"})
+        return
+
+    if not paths:
+        paths = ["/home", "/etc", "/var/log"]
+
+    # Normalize paths
+    paths = list(dict.fromkeys(paths))  # remove duplicates, keep order
+
+    print_event(
+        "INFO",
+        ", ".join(paths),
+        {
+            "Host": socket.gethostname(),
+            "OS": platform.platform(),
+            "Interval (sec)": interval,
+            "Note": "Using 'find' command for filesystem snapshot",
+        },
+    )
+
+    prev = build_snapshot(paths, exclude_dirs=EXCLUDE_DIRS)
+
+    while True:
+        time.sleep(interval)
+        curr = build_snapshot(paths, exclude_dirs=EXCLUDE_DIRS)
+
+        prev_paths = set(prev.keys())
+        curr_paths = set(curr.keys())
+
+        # ---------------- NEW FILES ----------------
+        created = curr_paths - prev_paths
+        for path in created:
+            mtime, size = curr[path]
+            extra = {
+                "Size (bytes)": size,
+                "Modified": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+            }
+            print_event("CREATED", path, extra)
+
+        # ---------------- DELETED FILES ----------------
+        deleted = prev_paths - curr_paths
+        for path in deleted:
+            mtime, size = prev[path]
+            extra = {
+                "Last known size": size,
+                "Last modified": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+            }
+            print_event("DELETED", path, extra)
+
+        # ---------------- MODIFIED FILES ----------------
+        common = prev_paths & curr_paths
+        for path in common:
+            old_mtime, old_size = prev[path]
+            new_mtime, new_size = curr[path]
+
+            if old_mtime != new_mtime or old_size != new_size:
+                extra = {
+                    "Old size": old_size,
+                    "New size": new_size,
+                    "Old mtime": datetime.fromtimestamp(old_mtime).isoformat(timespec="seconds"),
+                    "New mtime": datetime.fromtimestamp(new_mtime).isoformat(timespec="seconds"),
+                }
+                print_event("MODIFIED", path, extra)
+
+        prev = curr
+
+
+# =============================================================
+#  ENTRY POINT
+# =============================================================
+if __name__ == "__main__":
+    # Default: monitor key system locations
+    monitor_fs(paths=None, interval=5)

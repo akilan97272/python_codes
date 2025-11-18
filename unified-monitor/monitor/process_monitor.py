@@ -10,46 +10,65 @@ from emitter import EventEmitter
 from event import Event
 
 
-def emit_event(emitter: EventEmitter, source: str, subtype: str, data: dict):
-    """
-    Small helper: wrap data into Event and send via emitter.
-    We will reuse this pattern for all monitors.
-    """
+# -------------------------------------------------------------
+# PRINT CLEAN OUTPUT (C FORMAT — same as AUTH)
+# -------------------------------------------------------------
+def print_clean(subtype, data):
+    parts = [f"PROCESS | {subtype}"]
+    for key, value in data.items():
+        if value is not None:
+            parts.append(f"{key}={value}")
+    print(" | ".join(parts))
+
+
+# -------------------------------------------------------------
+# EMIT EVENT (silent emitter + clean stdout)
+# -------------------------------------------------------------
+def emit_event(emitter: EventEmitter, subtype: str, data: dict):
+    print_clean(subtype, data)
+
     event = Event(
-        source=source,                  # e.g. "process"
-        subtype=subtype,                # e.g. "start", "end", "info", "error"
-        ts=datetime.now().timestamp(),  # Unix timestamp (float)
-        host=socket.gethostname(),      # machine name
-        os=platform.platform(),         # OS description
-        data=data,                      # any additional fields
+        source="process",
+        subtype=subtype,
+        ts=datetime.now().timestamp(),
+        host=socket.gethostname(),
+        os=platform.platform(),
+        data=data,
     )
-    emitter.emit(event)
+
+    emitter.emit(event)     # silent emitter → NO table, NO dict, NO fallback
 
 
+# -------------------------------------------------------------
+# TAKE A SNAPSHOT OF CURRENT PROCESSES
+# -------------------------------------------------------------
 def get_process_snapshot() -> dict:
     """
-    Run 'ps -eo pid,comm' and return a dict: {pid: name}.
-    This is one snapshot of all running processes at the moment.
+    Returns a dict: { pid: name }
+    Uses Linux `ps` command.
     """
-    # Run Linux 'ps' command to list all processes with PID and command name
     out = subprocess.check_output(["ps", "-eo", "pid,comm"], text=True)
 
-    # Split into lines, skip the header ("PID COMMAND")
     lines = out.strip().splitlines()
     if not lines:
         return {}
 
-    lines = lines[1:]  # remove header line
+    # skip header ("PID COMMAND")
+    lines = lines[1:]
 
     snapshot = {}
 
     for line in lines:
-        # Split into: PID, NAME
         parts = line.strip().split(None, 1)
         if len(parts) != 2:
             continue
 
         pid_str, name = parts
+
+        # ignore "ps" command itself (avoid infinite spam)
+        if name == "ps":
+            continue
+
         try:
             pid = int(pid_str)
         except ValueError:
@@ -60,60 +79,48 @@ def get_process_snapshot() -> dict:
     return snapshot
 
 
+# -------------------------------------------------------------
+# MAIN PROCESS MONITOR LOOP
+# -------------------------------------------------------------
 def monitor_processes(emitter: EventEmitter, interval: int = 3):
-    """
-    Light-weight process monitor using only the 'ps' Linux command.
-
-    Every `interval` seconds:
-      - Get current process list
-      - Compare with previous list
-      - Emit:
-          source='process', subtype='start'  -> when a new PID appears
-          source='process', subtype='end'    -> when a PID disappears
-    """
-    # Only support Linux for now
     if platform.system().lower() != "linux":
-        emit_event(emitter, "process", "error", {"msg": "Process monitor only supports Linux"})
+        emit_event(emitter, "error", {"msg": "Process monitor only supports Linux"})
         return
 
-    emit_event(emitter, "process", "info", {"msg": "Process monitor started"})
+    print("PROCESS | info | monitoring=process_list")
 
-    prev = {}  # previous snapshot: {pid: name}
+    prev = {}
 
     while True:
-        curr = get_process_snapshot()          # current snapshot
+        curr = get_process_snapshot()
+
         prev_pids = set(prev.keys())
         curr_pids = set(curr.keys())
 
-        # 1) New processes = present now, but not before
+        # New processes
         for pid in curr_pids - prev_pids:
             emit_event(
                 emitter,
-                "process",
                 "start",
-                {"pid": pid, "name": curr[pid]},
+                {"pid": pid, "name": curr.get(pid)},
             )
 
-        # 2) Ended processes = present before, but not now
+        # Terminated processes
         for pid in prev_pids - curr_pids:
             emit_event(
                 emitter,
-                "process",
                 "end",
-                {"pid": pid, "name": prev[pid]},
+                {"pid": pid, "name": prev.get(pid)},
             )
 
-        # Update for next loop
         prev = curr
-
-        # Sleep a bit before checking again
         time.sleep(interval)
 
 
+# -------------------------------------------------------------
+# RUN
+# -------------------------------------------------------------
 if __name__ == "__main__":
-    # Adjust args depending on how your EventEmitter is defined in your project.
-    # In your unified runner you used something like:
-    #   EventEmitter(out="stdout", output_format="table")
-    # Here I keep a simple version; change if needed.
-    emitter = EventEmitter(out="stdout", output_format="table")
+    # SILENT emitter → only clean PROCESS lines, no duplicates
+    emitter = EventEmitter(out="silent", output_format="silent")
     monitor_processes(emitter, interval=3)

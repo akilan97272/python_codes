@@ -1,60 +1,150 @@
-from .base import BaseMonitor
-import platform
 import time
-
-try:
-    from systemd.journal import Reader
-except Exception:
-    Reader = None
-
-
-IS_LINUX = platform.system().lower().startswith("linux")
+import platform
+import socket
+from datetime import datetime
+from pathlib import Path
+import re
 
 
-class LogMonitor(BaseMonitor):
+# =============================================================
+#  SIMPLE EVENT CLASS
+# =============================================================
+class Event:
+    def __init__(self, source, subtype, ts, host, os, data):
+        self.source = source
+        self.subtype = subtype
+        self.ts = ts
+        self.host = host
+        self.os = os
+        self.data = data
+
+
+# =============================================================
+#  CLEAN, BASIC, HUMAN-READABLE EMITTER
+# =============================================================
+class EventEmitter:
+    def emit(self, event: Event):
+        timestamp = datetime.fromtimestamp(event.ts).strftime("%Y-%m-%d %H:%M:%S")
+
+        print(f"[{event.subtype.upper()}] {timestamp}")
+        print(f"File:     {event.data.get('file')}")
+        print(f"Message:  {event.data.get('message')}")
+        print()  # blank line for readability
+
+
+# =============================================================
+#  SHORTEN MESSAGE (IMPORTANT PART)
+# =============================================================
+def shorten_message(raw_msg):
     """
-    Guaranteed-working Linux journald monitor.
-    Always streams NEW logs appearing on the system.
+    Reduce noisy syslog message to only the human-important part.
     """
 
-    def __init__(self, emitter, poll_interval=1.0):
-        super().__init__("log", emitter, poll_interval)
+    msg = raw_msg
 
-    def monitor(self):
-        if not IS_LINUX or Reader is None:
-            self.emit("warning", {"msg": "python-systemd not available"})
-            return
+    # Remove ISO timestamps at start
+    if re.match(r"\d{4}-\d{2}-\d{2}", msg):
+        msg = msg.split(" ", 1)[1]
 
-        self._stream_all_journal_logs()
+    # Remove hostname if present
+    hostname = socket.gethostname()
+    if msg.startswith(hostname + " "):
+        msg = msg[len(hostname) + 1:]
 
-    # ---------------------------------------------------------------------
-    # FINAL WORKING VERSION — tested on Kali, Ubuntu, Debian, Arch
-    # ---------------------------------------------------------------------
-    def _stream_all_journal_logs(self):
+    # Remove PID [xxxx]
+    msg = re.sub(r"\[\d+\]", "", msg)
 
-        r = Reader()
-        r.this_boot()       # Logs from this boot only
-        r.seek_tail()       # Jump to end
-        r.get_previous()    # Clear existing entries
+    # Keep only message part after first colon
+    if ":" in msg:
+        msg = msg.split(":", 1)[1].strip()
 
-        self.emit("info", {"msg": "📡 Streaming ALL journald logs (live) ..."})
+    # Remove duplicate spaces
+    msg = " ".join(msg.split())
 
-        while not self.stopped():
-            r.wait(1_000_000)   # Wait max 1 second for new logs
+    return msg
 
-            for entry in r:
-                msg = entry.get("MESSAGE", "")
-                src = entry.get("SYSLOG_IDENTIFIER", "unknown")
-                unit = entry.get("_SYSTEMD_UNIT", "unknown")
 
-                self.emit("event", {
-                    "source": src,
-                    "unit": unit,
-                    "msg": msg
-                })
+# =============================================================
+#  EMIT EVENT WRAPPER
+# =============================================================
+def emit_event(emitter, subtype, data):
+    event = Event(
+        source="log",
+        subtype=subtype,
+        ts=datetime.now().timestamp(),
+        host=socket.gethostname(),
+        os=platform.platform(),
+        data=data
+    )
+    emitter.emit(event)
 
-            time.sleep(0.1)
 
-#sudo systemctl restart ssh
-#👉 It watches your system logs LIVE and shows what your computer is doing in the background.
-#Your Log Monitor shows live events happening inside the Linux system — like a real-time activity tracker for the OS.
+# =============================================================
+#  SELECT LOG FILE
+# =============================================================
+def choose_log_file():
+    logfile = "/var/log/syslog"
+    if Path(logfile).exists():
+        print(f"[log-monitor] Using: {logfile}")
+        return logfile
+    raise FileNotFoundError("syslog not found")
+
+
+# =============================================================
+#  CLASSIFY SEVERITY
+# =============================================================
+def classify(line):
+    l = line.lower()
+
+    if any(w in l for w in ("error", "failed", "panic", "critical")):
+        return "error"
+    if any(w in l for w in ("warn", "warning")):
+        return "warning"
+    if any(w in l for w in ("info", "started", "connected", "listening")):
+        return "info"
+    return "other"
+
+
+# =============================================================
+#  MAIN LOG MONITOR LOOP
+# =============================================================
+def monitor_log_file(emitter, logfile=None, interval=0.1):
+    logfile = logfile or choose_log_file()
+
+    print(f"[log-monitor] Tailing {logfile}\n")
+
+    with open(logfile, "r", errors="ignore") as f:
+        f.seek(0, 2)
+
+        while True:
+            line = f.readline()
+
+            if not line:
+                time.sleep(interval)
+                continue
+
+            line = line.strip()
+            if not line:
+                continue
+
+            level = classify(line)
+            if level == "other":
+                continue
+
+            short_msg = shorten_message(line)
+
+            data = {
+                "file": logfile,
+                "level": level,
+                "message": short_msg,
+            }
+
+            emit_event(emitter, level, data)
+
+
+# =============================================================
+#  ENTRY POINT
+# =============================================================
+if __name__ == "__main__":
+    emitter = EventEmitter()
+    monitor_log_file(emitter)
